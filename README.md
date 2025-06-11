@@ -11,6 +11,8 @@ I also asked...what if market maker but AI? So I built in a LTSM Neural Network 
 
 **Geoff 2.0 offers market-making for a single perpetual asset on the Hyperliquid exchange with NN-powered spread prediction. Geoff is not containerized at this time. It comes with a basic TUI, analytics and paper trading.**
 
+_Paper trading is currently broken because I didn't validate Cursor's implementation past a certain point, its wrong, obviously._
+
 This was my first foray into vibe coding. I used Cursor (the $20 a month subscription) and found that it could fill out the bulk of code but fell at many logical hurdles, ignored context of instructions, over-engineered solutions and imported nonexistent or unneccessary packages. However, the worst of the problems was found when debugging API calls and using the Hyperliquid python SDK. My boy cursor got stuck in recursive loops of problem and solution.
 It was still extremely useful and allowed me to put this together in a day or two. 
 
