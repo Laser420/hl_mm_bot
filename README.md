@@ -88,13 +88,13 @@ python paper_trader.py #untested because Im lazy
 
 ## Use
 Geoff 2.0 will open with a number of options to select. 
-    - "Start Live Trading",         # Begins live trading on Hyperliquid with the given configuration
-    - "Start Paper Trading",        # Begins paper trading simulating Hyperliquid with the given configuration 
-    - "Stop Bot",                   # Only appears when bot is running, stops the bot
-    - "View Bot Output",            # Opens up the console and shows raw bot console output. Press ctrl + c to exit
-    - "Analyze Trading Session",    # Opens a menu where you select a particular trade session to be analyzed. Graphs will appear one at a time
-    - "Generate Test Session",      # Debug option that creates a fake session to check the analysis feature
-     - "Exit"                       # Exit the bot, will ask to quit the bot if it is still running
+- "Start Live Trading",         # Begins live trading on Hyperliquid with the given configuration
+- "Start Paper Trading",        # Begins paper trading simulating Hyperliquid with the given configuration 
+- "Stop Bot",                   # Only appears when bot is running, stops the bot
+- "View Bot Output",            # Opens up the console and shows raw bot console output. Press ctrl + c to exit
+- "Analyze Trading Session",    # Opens a menu where you select a particular trade session to be analyzed. Graphs will appear one at a time
+- "Generate Test Session",      # Debug option that creates a fake session to check the analysis feature
+- "Exit"                       # Exit the bot, will ask to quit the bot if it is still running
 
 Note 1: If you exit and determine to leave the bot running in the background, you will have to restart the app to select "Stop Bot" to stop the bot.
 Or if you have the PID then you can terminate it manually.
