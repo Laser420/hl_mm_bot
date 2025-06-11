@@ -1,0 +1,36 @@
+# Trading Bot Configuration
+
+# Asset to trade
+asset: "ETH"
+
+# Bot settings
+update_interval: 1.0  # Time between updates in seconds
+
+# Universal Parameters
+universal:
+  asset: "ETH"    # Trading pair (e.g., "BTC")
+
+# Data Collection
+data:
+  timeframe: 60   # Data timeframe in seconds (1 minute)
+  sequence_length: 10 # Number of periods to present as sequences to the LSTM model
+  lookback_period: 2880 # Number of periods to look back (2 days * 24 hours * 60 minutes)
+
+# Trading Parameters
+trading:
+  # Position and Risk Management
+  max_position_size: 0.05  # Maximum position size in base units (e.g., BTC, ETH)
+  leverage: 1  # Trading leverage multiplier
+  profit_target: 0.005  # Take profit target as a decimal (0.5%)
+  stop_loss: 0.0005  # Stop loss as a decimal (0.05%, reduced from 0.1%)
+  
+  # Entry Signal Parameters
+  min_volatility_threshold: 0.005  # Minimum volatility required to enter a trade - 0.5%
+  
+  # Volatility Scaling
+  min_volatility_factor: 0.5  # Minimum position size multiplier when volatility is low (50% of max size, increased from 20%)
+  max_volatility_factor: 1.0  # Maximum position size multiplier (100% of max size)
+  volatility_scaling_threshold: 0.0001  # Volatility level at which we use full position size (0.01%, reduced from 0.5%)
+  
+  # System Parameters
+  update_interval: 1.0  # Time between updates in seconds (1s)

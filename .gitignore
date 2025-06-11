@@ -1,0 +1,17 @@
+# Python
+__pycache__/*
+.__pycache__/*
+analysis/*
+
+# Virtual Environment
+.env.local
+
+logs/bot.log
+
+# Logs and Session Data
+logs/sessions/*
+
+.csv
+.json
+.yaml
+!config.yaml  # Keep the main config file
