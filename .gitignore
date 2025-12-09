@@ -3,6 +3,8 @@ __pycache__/*
 .__pycache__/*
 analysis/*
 
+venv
+
 # Virtual Environment
 .env.local
 

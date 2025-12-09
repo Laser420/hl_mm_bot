@@ -1,184 +1,164 @@
+#!/usr/bin/env python3
+"""
+Bracket Market Maker for Hyperliquid
+Uses dual accounts with automated bracket orders (TP + SL) for risk management
+Places fixed spread orders and protects each position with exchange-level brackets
+"""
+
 import logging
 import time
 import yaml
-from typing import Dict, List, Tuple
-from datetime import datetime, timedelta
-import os
 import asyncio
-import threading
-from queue import Queue
 import signal
+import sys
+from datetime import datetime
+from typing import Dict, Optional, Tuple
 
-import torch
-import numpy as np
 from hyperliquid.utils import constants
-from utils.data_fetcher import DataFetcher
 from utils.utils import setup
 from utils.trade_logger import TradeLogger
-from utils.tui import TradingTUI
-from utils.analytics import TradingAnalytics
-from models.spread_predictor import SpreadPredictor, SpreadDataProcessor
+from utils.HL_executor import OrderExecutor, HyperliquidExecutor, PaperExecutor
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-class OrderBook:
-    def __init__(self):
-        self.bids: List[Dict] = []  # List of bid orders
-        self.asks: List[Dict] = []  # List of ask orders
-        self.last_price: float = 0.0
-        self.last_update: datetime = datetime.now()
-        self.base_spread: float = 0.001  # Base spread of 0.1%
-        self.inventory_skew: float = 0.0  # Skew factor based on inventory
 
-    def update(self, mid_price: float, position: float, max_position: float):
-        """Update the order book with new mid price and position-based adjustments."""
-        self.last_price = mid_price
-        self.last_update = datetime.now()
-        
-        # Calculate inventory skew factor (-1 to 1)
-        self.inventory_skew = position / max_position
-        
-        # Calculate dynamic spread based on inventory
-        # Wider spread when inventory is skewed
-        spread_multiplier = 1.0 + abs(self.inventory_skew)
-        current_spread = self.base_spread * spread_multiplier
-        
-        # Calculate bid and ask prices with inventory skew
-        # When long, we want to sell more aggressively (lower ask)
-        # When short, we want to buy more aggressively (higher bid)
-        bid_skew = -self.inventory_skew * current_spread * 0.5
-        ask_skew = self.inventory_skew * current_spread * 0.5
-        
-        bid_price = mid_price - (current_spread / 2) + bid_skew
-        ask_price = mid_price + (current_spread / 2) + ask_skew
-        
-        # Clear existing orders
-        self.bids = []
-        self.asks = []
-        
-        # Add new orders with size based on inventory
-        # When long, reduce bid size and increase ask size
-        # When short, increase bid size and reduce ask size
-        bid_size = 1.0 * (1 - self.inventory_skew)
-        ask_size = 1.0 * (1 + self.inventory_skew)
-        
-        self.bids.append({
-            'price': bid_price,
-            'size': max(0.1, bid_size),  # Minimum size of 0.1
-            'timestamp': self.last_update
-        })
-        
-        self.asks.append({
-            'price': ask_price,
-            'size': max(0.1, ask_size),  # Minimum size of 0.1
-            'timestamp': self.last_update
-        })
-
-    def get_best_bid(self) -> Dict:
-        return self.bids[0] if self.bids else None
-
-    def get_best_ask(self) -> Dict:
-        return self.asks[0] if self.asks else None
-
-
-class MarketMaker:
-    def __init__(self, config_path: str = "config.yaml", session_id: str = None):
-        """Initialize the market maker with configuration"""
+class BracketMarketMaker:
+    def __init__(self, config_path: str = "config.yaml", paper_trading: bool = False):
+        """Initialize the bracket market maker"""
         self.config = self._load_config(config_path)
-        self.trading_params = self.config.get('trading', {})
+        self.paper_trading = paper_trading
         
-        # Initialize HyperLiquid client
-        self.account_address, self.info, self.exchange = setup(
-            base_url=constants.MAINNET_API_URL,
-            skip_ws=True
-        )
-        self.coin = self.config.get('universal', {}).get('asset', 'BTC')
+        # Validate required configuration
+        self._validate_config()
         
-        # Initialize trading parameters from config with defaults
-        self.max_position_size = self.trading_params.get('max_position_size', 1.0)
-        self.leverage = self.trading_params.get('leverage', 1.0)
-        self.profit_target = self.trading_params.get('profit_target', 0.002)  # 0.2% default
-        self.stop_loss = self.trading_params.get('stop_loss', 0.001)  # 0.1% default
+        # Initialize appropriate executor
+        if paper_trading:
+            self.executor = PaperExecutor()
+            # Initialize info client for data only
+            from hyperliquid.info import Info
+            self.info = Info(base_url=constants.MAINNET_API_URL, skip_ws=True)
+            logger.info("Initialized in paper trading mode with live data")
+        else:
+            # Initialize HyperLiquid clients
+            accounts, info = setup(
+                base_url=constants.MAINNET_API_URL,
+                skip_ws=True
+            )
+            
+            if not accounts['is_dual']:
+                raise ValueError("Live trading requires dual accounts. Use paper_trading=True for single account mode.")
+            
+            self.executor = HyperliquidExecutor(
+                accounts['buy']['exchange'],
+                accounts['sell']['exchange'], 
+                accounts['buy']['address'],
+                accounts['sell']['address'],
+                info
+            )
+            self.info = info
+            logger.info("Initialized in live trading mode with dual accounts")
         
-        # Initialize volatility parameters
-        self.volatility_window = self.trading_params.get('volatility_window', 20)
-        self.min_volatility_threshold = self.trading_params.get('min_volatility_threshold', 0.0001)
-        self.max_volatility_threshold = self.trading_params.get('max_volatility_threshold', 0.01)
-        self.volatility_scaling_threshold = self.trading_params.get('volatility_scaling_threshold', 0.005)
-        self.min_volatility_factor = self.trading_params.get('min_volatility_factor', 0.5)
-        self.max_volatility_factor = self.trading_params.get('max_volatility_factor', 1.0)
+        # Trading parameters from config
+        self.coin = self.config['universal']['asset']
+        self.order_size = self.config['trading']['order_size']
         
-        # Set leverage at the start of the session
-        try:
-            self.exchange.update_leverage(self.leverage, self.coin)
-            logger.info(f"Set leverage to {self.leverage}x for {self.coin}")
-        except Exception as e:
-            logger.error(f"Failed to set leverage: {e}")
+        # Simple spread configuration for bracket trading
+        self.spread_bps = self.config['trading']['base_spread_bps']
         
-        # Get session ID and directory from environment or use default
-        self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.session_dir = os.getenv("SESSION_DIR", os.path.join("logs", "sessions", "default_session"))
-        os.makedirs(self.session_dir, exist_ok=True)
-        print(f"[MarketMaker] Using session directory: {self.session_dir}")
-        
-        # Set session directory in environment for TradeLogger
-        os.environ["SESSION_DIR"] = self.session_dir
-        
-        # Initialize components
-        self.trade_logger = TradeLogger(session_id=self.session_id, config=self.config)
-        
-        # Initialize state
-        self.current_data = []
+        # State tracking
         self.current_price = 0.0
         self.current_position = 0.0
-        self.current_pnl = 0.0
-        self.last_trade_time = 0
-        self.trade_count = 0
-        self.total_pnl = 0.0
-        self.is_running = True
+        self.bid_order_id = None
+        self.ask_order_id = None
+        self.running = True
         
-        # Initialize performance metrics
-        self.performance_metrics = {
-            'total_trades': 0,
-            'winning_trades': 0,
-            'losing_trades': 0,
-            'avg_trade_pnl': 0.0
+        # Order tracking for fill detection
+        self.active_orders = {}  # {order_id: {'side': 'buy'/'sell', 'size': float, 'price': float, 'timestamp': float}}
+        self.active_stop_orders = {}  # {order_id: {'original_fill': dict, 'stop_price': float, 'size': float, 'side': str}}
+        
+        # Single-loop coordination - now configurable
+        self.trading_lock = asyncio.Lock()     # Protects all trading state
+        self.needs_order_refresh = False      # Signal to refresh orders
+        self.last_order_refresh = 0.0         # Last time orders were refreshed
+        
+        # Logging configuration (optional parameters with defaults)  
+        trading_config = self.config['trading']
+        self.enable_debug_logging = trading_config.get('enable_debug_logging', False)
+        self.log_fill_checks = trading_config.get('log_fill_checks', False)
+        self.log_strategy_skips = trading_config.get('log_strategy_skips', False)
+        
+        # Timing configuration (after trading_config is defined)
+        self.trading_interval = trading_config.get('trading_interval', 2.0)       # Main trading loop interval (seconds)
+        self.order_refresh_interval = trading_config.get('order_refresh_interval', 30.0)  # Minimum refresh interval
+        
+        # Bracket trading configuration
+        self.enable_bracket_protection = trading_config.get('enable_bracket_protection', True)
+        self.profit_target_pct = trading_config.get('profit_target_pct', 0.005)  # 0.5% take-profit
+        self.stop_loss_pct = trading_config.get('stop_loss_pct', 0.0025)  # 0.25% stop-loss
+        self.bracket_buffer = trading_config.get('bracket_buffer', 0.001)  # 0.1% buffer
+        
+        
+        # Single lock for all trading operations - no deadlock concerns
+        
+        # Profit and PnL tracking
+        self.realized_pnl = 0.0
+        self.unrealized_pnl = 0.0
+        self.total_fees_paid = 0.0
+        self.trade_count = 0
+        self.avg_entry_price = 0.0  # Volume-weighted average entry price
+        
+        # Generate session ID
+        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if paper_trading:
+            session_id = f"paper_{session_id}"
+        
+        # Initialize trade logger
+        self.trade_logger = TradeLogger(session_id=session_id, config=self.config)
+        
+        # Signal handling for controlled shutdown
+        self.shutdown_requested = False
+        self.shutdown_reason = ""
+        self._setup_signal_handlers()
+        
+        logger.info(f"Bracket Market Maker initialized - Asset: {self.coin}")
+        logger.info(f"Spread: {self.spread_bps} bps, Order size: {self.order_size}")
+        logger.info(f"Trading interval: {self.trading_interval}s, Order refresh: {self.order_refresh_interval}s")
+        logger.info("Signal handlers installed - Use Ctrl+C or SIGTERM for controlled shutdown")
+
+    def _validate_config(self):
+        """Validate required configuration parameters"""
+        required_keys = {
+            'universal': ['asset'],
+            'trading': ['order_size', 'base_spread_bps']
         }
         
-        # Initialize trade frequency tracking
-        self.minute_start = datetime.now()
-        self.trades_per_minute = 0
+        for section, keys in required_keys.items():
+            if section not in self.config:
+                raise ValueError(f"Missing required config section: {section}")
+            
+            for key in keys:
+                if key not in self.config[section]:
+                    raise ValueError(f"Missing required config parameter: {section}.{key}")
         
-        # Initialize ML model and data processor
-        self.model = SpreadPredictor(input_size=4, hidden_size=64)
-        self.data_processor = SpreadDataProcessor(sequence_length=10)
+        # Validate parameter ranges
+        trading = self.config['trading']
+        if trading['order_size'] <= 0:
+            raise ValueError("order_size must be positive")
+        if trading['base_spread_bps'] <= 0:
+            raise ValueError("base_spread_bps must be positive")
         
-        # Test log entry to verify file creation
-        self.trade_logger.log_trade({
-            'timestamp': int(time.time()),
-            'order_id': 'test',
-            'asset': 'ETH',
-            'side': 'test',
-            'size': 0,
-            'price': 0,
-            'position_after': 0,
-            'pnl': 0,
-            'pnl_after': 0
-        })
-        
-        logger.info("Market Maker initialized with configuration:")
-        logger.info(f"Session ID: {self.session_id}")
-        logger.info(f"Session Directory: {self.session_dir}")
-        logger.info(f"Coin: {self.coin}")
-        logger.info(f"Max Position Size: {self.max_position_size}")
-        logger.info(f"Leverage: {self.leverage}")
-        logger.info(f"Profit Target: {self.profit_target}")
-        logger.info(f"Stop Loss: {self.stop_loss}")
-        logger.info(f"Volatility Window: {self.volatility_window}")
-        logger.info(f"Volatility Thresholds: {self.min_volatility_threshold} - {self.max_volatility_threshold}")
+        # Validate timing parameters
+        trading_interval = trading.get('trading_interval', 2.0)
+        order_refresh_interval = trading.get('order_refresh_interval', 30.0)
+        if trading_interval <= 0:
+            raise ValueError("trading_interval must be positive")
+        if order_refresh_interval <= 0:
+            raise ValueError("order_refresh_interval must be positive")
+        if trading_interval >= order_refresh_interval:
+            raise ValueError("trading_interval must be less than order_refresh_interval")
 
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration from YAML file"""
@@ -193,663 +173,971 @@ class MarketMaker:
         except yaml.YAMLError as e:
             logger.error(f"Error parsing config file {config_path}: {e}")
             return {}
-
-    def update_performance_metrics(self, trade_pnl: float):
-        """Update performance metrics after each trade."""
-        self.performance_metrics['total_trades'] += 1
-        if trade_pnl > 0:
-            self.performance_metrics['winning_trades'] += 1
-        else:
-            self.performance_metrics['losing_trades'] += 1
-        
-        # Update average trade PnL
-        total_pnl = self.performance_metrics['avg_trade_pnl'] * (self.performance_metrics['total_trades'] - 1)
-        self.performance_metrics['avg_trade_pnl'] = (total_pnl + trade_pnl) / self.performance_metrics['total_trades']
-        # logger.info(f"Trade PnL: {trade_pnl:.6f}, Cumulative PnL: {self.pnl:.6f}")
-
-    def update_trade_frequency(self):
-        """Update trade frequency metrics."""
-        current_time = datetime.now()
-        time_diff = (current_time - self.minute_start).total_seconds()
-        
-        if time_diff >= 60:  # New minute
-            self.trades_per_minute = self.trade_count
-            logger.info(f"Trading frequency: {self.trades_per_minute} trades per minute")
-            self.trade_count = 0
-            self.minute_start = current_time
-
-    def round_price(self, price: float) -> float:
-        """
-        Round the price according to Hyperliquid's specifications:
-        - Up to 5 significant figures
-        - No more than MAX_DECIMALS - szDecimals decimal places
-        - Integer prices always allowed
-        """
-        # If price is an integer, return as is
-        if price.is_integer():
-            return int(price)
-            
-        # For prices >= 1000, round to nearest integer
-        if price >= 1000:
-            return round(price)
-            
-        # For prices < 1000, round to 5 significant figures
-        # First convert to scientific notation to count significant figures
-        str_price = f"{price:.10f}"
-        # Remove trailing zeros
-        str_price = str_price.rstrip('0').rstrip('.')
-        
-        # If we have more than 5 significant figures, round appropriately
-        if len(str_price.replace('.', '')) > 5:
-            # For prices < 1, we need to be more careful with decimal places
-            if price < 1:
-                # Count leading zeros after decimal point
-                decimal_part = str_price.split('.')[1]
-                leading_zeros = len(decimal_part) - len(decimal_part.lstrip('0'))
-                # Round to appropriate decimal places
-                return round(price, leading_zeros + 5)
-            else:
-                # For prices >= 1, round to 5 significant figures
-                return round(price, 5 - len(str(int(price))))
-        return float(str_price)
-
-    async def execute_trade(self, side, size, price=None):
-        """Execute a trade with the given parameters."""
+    
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for controlled shutdown"""
         try:
-            is_buy = side if isinstance(side, bool) else side.lower() == 'buy'
+            # Handle SIGINT (Ctrl+C)
+            signal.signal(signal.SIGINT, self._signal_handler)
             
-            # Log position before trade
-            position_data = {
-                'timestamp': datetime.now().timestamp(),
-                'asset': self.coin,
-                'size': self.current_position,
-                'value': self.current_position * (price if price else self.current_price),
-                'entry_price': self.current_price
-            }
-            self.trade_logger.log_position(position_data)
+            # Handle SIGTERM (system termination)
+            signal.signal(signal.SIGTERM, self._signal_handler)
             
-            # Place order using self.exchange
-            if price:
-                # Limit order
-                rounded_price = self.round_price(price)
-                order_result = self.exchange.order(
-                    self.coin,
-                    is_buy,
-                    size,
-                    rounded_price,
-                    {
-                        "limit": {
-                            "tif": "Gtc"
-                        },
-                        "leverage": self.leverage
-                    }
-                )
-                order_price = rounded_price
-            else:
-                # Market order
-                order_result = self.exchange.market_open(
-                    self.coin,
-                    is_buy,
-                    size,
-                    None,  # No price for market orders
-                    0.01   # Slippage tolerance
-                )
-                order_price = 'MARKET'
+            # On Windows, also handle SIGBREAK (Ctrl+Break)
+            if hasattr(signal, 'SIGBREAK'):
+                signal.signal(signal.SIGBREAK, self._signal_handler)
+                
+            logger.debug("Signal handlers installed successfully")
             
-            # Update position
-            if is_buy:
-                self.current_position += size
-            else:
-                self.current_position -= size
-            
-            # Calculate trade PnL (only for limit orders with known price)
-            if price:
-                trade_pnl = size * (rounded_price - self.current_price) * (1 if is_buy else -1)
-                self.current_pnl += trade_pnl
-            else:
-                trade_pnl = 0  # Market orders will update PnL on next price update
-            
-            # Log the trade
-            trade_data = {
-                'timestamp': datetime.now().timestamp(),
-                'order_id': order_result.get('orderId'),
-                'asset': self.coin,
-                'side': 'buy' if is_buy else 'sell',
-                'size': size,
-                'price': order_price,
-                'position_after': self.current_position,
-                'pnl': trade_pnl,
-                'pnl_after': self.current_pnl
-            }
-            self.trade_logger.log_trade(trade_data)
-            
-            # Log updated position
-            position_data = {
-                'timestamp': datetime.now().timestamp(),
-                'asset': self.coin,
-                'size': self.current_position,
-                'value': self.current_position * (price if price else self.current_price),
-                'entry_price': self.current_price
-            }
-            self.trade_logger.log_position(position_data)
-            
-            return {
-                'side': side,
-                'size': size,
-                'price': order_price,
-                'order_id': order_result.get('orderId')
-            }
         except Exception as e:
-            logger.error(f"Error executing trade: {e}")
-            raise
-
-    def train_model(self, candle_data: List[Dict], epochs: int = 10):
-        """Train the model on historical data."""
-        logger.info("Training model on historical data...")
+            logger.warning(f"Failed to install signal handlers: {e}")
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals with proper cleanup"""
+        signal_names = {
+            signal.SIGINT: "SIGINT (Ctrl+C)",
+            signal.SIGTERM: "SIGTERM (System Termination)",
+        }
         
-        # Prepare training data
-        X, y = self.data_processor.prepare_data(candle_data)
-        if len(X) == 0:
-            logger.error("No training data available!")
+        # Add Windows-specific signal if available
+        if hasattr(signal, 'SIGBREAK'):
+            signal_names[signal.SIGBREAK] = "SIGBREAK (Ctrl+Break)"
+        
+        signal_name = signal_names.get(signum, f"Signal {signum}")
+        
+        if not self.shutdown_requested:
+            self.shutdown_requested = True
+            self.shutdown_reason = f"Received {signal_name}"
+            logger.info(f"🛑 {signal_name} received - initiating controlled shutdown...")
+            logger.info("⏳ Please wait for intelligent shutdown process to complete...")
+            
+            # Stop the trading loop gracefully
+            self.running = False
+        else:
+            logger.warning(f"🚨 Multiple shutdown signals received! First: {self.shutdown_reason}, Now: {signal_name}")
+            logger.warning("⚠️ Allowing current shutdown process to complete...")
+
+    def get_current_price(self) -> float:
+        """Get current live midpoint price using allmids endpoint"""
+        try:
+            all_mids = self.info.all_mids()
+            
+            # Debug: Check the type and content of the response
+            logger.debug(f"all_mids response type: {type(all_mids)}")
+            logger.debug(f"all_mids response: {all_mids}")
+            
+            # Handle different response formats
+            if isinstance(all_mids, str):
+                logger.error(f"all_mids returned string instead of dict/list: {all_mids}")
+                return 0.0
+            
+            # Handle dictionary response (most likely format)
+            if isinstance(all_mids, dict):
+                # Check if our coin is directly in the dict
+                if self.coin in all_mids:
+                    price = float(all_mids[self.coin])
+                    self.current_price = price
+                    if self.enable_debug_logging:
+                        logger.debug(f"Current price for {self.coin}: {price:.2f}")
+                    return price
+                
+                # Maybe it's a nested structure - check keys
+                logger.debug(f"Available coins in response: {list(all_mids.keys())}")
+                
+                # Try to find nested structure
+                for key, value in all_mids.items():
+                    if isinstance(value, dict) and 'coin' in value and value['coin'] == self.coin:
+                        price = float(value['mid'])
+                        self.current_price = price
+                        logger.debug(f"Current price for {self.coin}: {price:.2f}")
+                        return price
+                
+                logger.warning(f"Price not found for {self.coin} in available coins: {list(all_mids.keys())}")
+                return 0.0
+            
+            # Handle list response (original expected format)
+            if isinstance(all_mids, list):
+                for mid_data in all_mids:
+                    if isinstance(mid_data, dict) and mid_data.get('coin') == self.coin:
+                        price = float(mid_data['mid'])
+                        self.current_price = price
+                        logger.debug(f"Current price for {self.coin}: {price:.2f}")
+                        return price
+                
+                logger.warning(f"Price not found for {self.coin} in {len(all_mids)} available coins")
+                return 0.0
+            
+            logger.error(f"all_mids returned unexpected type: {type(all_mids)}")
+            return 0.0
+            
+        except Exception as e:
+            logger.error(f"Error getting current price: {e}")
+            return 0.0
+
+    # Note: get_candle_data moved to legacy_utils.py - not needed for bracket trading
+
+    async def update_position(self):
+        """Update current position from exchange"""
+        try:
+            # Atomically update position under lock protection
+            async with self.trading_lock:
+                self.current_position = self.executor.get_position(self.coin)
+                if self.enable_debug_logging:
+                    logger.debug(f"Current position: {self.current_position}")
+        except Exception as e:
+            logger.error(f"Error updating position: {e}")
+
+    async def check_fills(self) -> bool:
+        """Check for order fills and update position/profit tracking. Returns True if any fills occurred."""
+        try:
+            filled_orders = []      # Orders that were filled - need processing
+            cancelled_orders = []   # Orders that were cancelled - just cleanup
+            stop_fills = []         # Stop-loss orders that were filled
+            
+            # Create atomic snapshot of active orders under lock protection
+            async with self.trading_lock:
+                active_orders_snapshot = dict(self.active_orders)
+                active_stop_orders_snapshot = dict(self.active_stop_orders)
+            
+            # Check regular market-making orders
+            for order_id, order_info in active_orders_snapshot.items():
+                # Check order status using executor
+                is_buy = order_info['side'] == 'buy'
+                status = self.executor.check_order_status(self.coin, order_id, is_buy)
+                
+                if status['status'] == 'filled':
+                    # Process the fill for profit tracking
+                    await self._process_fill(order_id, order_info, status)
+                    filled_orders.append(order_id)
+                elif status['status'] == 'cancelled':
+                    # Just track for cleanup (no fill processing)
+                    cancelled_orders.append(order_id)
+                    logger.info(f"Order {order_id} was cancelled")
+            
+            # Check stop-loss orders
+            for order_id, stop_info in active_stop_orders_snapshot.items():
+                is_buy = stop_info['side'] == 'buy'
+                status = self.executor.check_order_status(self.coin, order_id, is_buy)
+                
+                if status['status'] == 'filled':
+                    # Process bracket order fill (TP or SL)
+                    await self._process_bracket_fill(order_id, stop_info, status)
+                    stop_fills.append(order_id)
+                elif status['status'] == 'cancelled':
+                    # Clean up cancelled stop orders
+                    async with self.trading_lock:
+                        if order_id in self.active_stop_orders:
+                            del self.active_stop_orders[order_id]
+                    logger.info(f"Stop-loss order {order_id} was cancelled")
+            
+            # If any fills occurred, clean up and signal order refresh
+            if filled_orders or stop_fills:
+                await self._cleanup_filled_orders(filled_orders, stop_fills)
+                self.needs_order_refresh = True
+                return True
+            
+            # Clean up cancelled orders only
+            if cancelled_orders:
+                async with self.trading_lock:
+                    for order_id in cancelled_orders:
+                        if order_id in self.active_orders:
+                            del self.active_orders[order_id]
+                        # Clear order IDs if they match
+                        if order_id == self.bid_order_id:
+                            self.bid_order_id = None
+                        if order_id == self.ask_order_id:
+                            self.ask_order_id = None
+            
+            return False  # No fills occurred
+                    
+        except Exception as e:
+            logger.error(f"Error checking fills: {e}")
             return False
-        
-        # Convert to numpy arrays first, then to tensors
-        X_np = np.array(X)
-        y_np = np.array(y)
-        X_tensor = torch.FloatTensor(X_np)
-        y_tensor = torch.FloatTensor(y_np)
-        
-        # Use the proper training function
-        from models.spread_predictor import train_model as train_model_fn
-        losses = train_model_fn(
-            model=self.model,
-            X=X_tensor,
-            y=y_tensor,
-            epochs=epochs,
-            batch_size=32,
-            learning_rate=0.001
-        )
-        
-        logger.info("Model training completed!")
-        return True
 
-    def calculate_position_size(self, current_price: float, spread: float) -> float:
-        """
-        Calculate appropriate position size based on current conditions.
-        Leverage is applied to max_position_size to determine actual position capacity.
-        """
-        # Base size on current position and max position (adjusted for leverage)
-        leveraged_max_size = self.max_position_size * self.leverage
-        remaining_capacity = leveraged_max_size - abs(self.current_position)
-        
-        # Calculate volatility from recent candles
-        recent_candles = self.current_data[-5:]  # Last 5 candles
-        if len(recent_candles) >= 2:
-            price_changes = []
-            for i in range(1, len(recent_candles)):
-                prev_close = (float(recent_candles[i-1]['h']) + float(recent_candles[i-1]['l'])) / 2
-                curr_close = (float(recent_candles[i]['h']) + float(recent_candles[i]['l'])) / 2
-                price_changes.append(abs(curr_close - prev_close) / prev_close)
-            volatility = sum(price_changes) / len(price_changes)
-        else:
-            volatility = 0.001  # Default to 0.1% if not enough data
-        
-        # Adjust size based on spread width and volatility
-        spread_factor = min(1.0, spread / (self.min_spread_threshold * 2))
-        volatility_factor = max(0.2, min(1.0, 0.001 / (volatility + 1e-10)))  # Inverse relationship with volatility
-        
-        # Calculate base size with dynamic adjustment
-        base_size = self.max_position_size * spread_factor * volatility_factor
-        
-        # Ensure we don't exceed remaining capacity
-        return min(base_size, remaining_capacity)
-
-    def should_enter_trade(self, current_price: float, volatility: float) -> Tuple[bool, str, float]:
-        """
-        Determine if we should enter a trade based on market conditions
-        Returns: (should_trade, side, size)
-        """
-        # Calculate position size based on volatility
-        size = self._calculate_position_size()
-        
-        # If we have no position, look for entry opportunities
-        if self.current_position == 0:
-            # Simple market making strategy: alternate between buy and sell
-            if self.trade_count % 2 == 0:
-                return True, "buy", size
+    async def _cleanup_filled_orders(self, filled_orders, stop_fills):
+        """Clean up filled orders and prepare for position-aware order refresh"""
+        async with self.trading_lock:
+            # 1. Cancel any remaining live orders on exchange
+            await self._cancel_orders_unsafe()
+            await self._cancel_stop_orders_unsafe()
+            
+            # 2. Clear memory after cancellations complete
+            self.active_orders.clear()
+            self.active_stop_orders.clear()
+            self.bid_order_id = None
+            self.ask_order_id = None
+            
+            logger.info("🔄 Orders cleaned up after fills - ready for position-aware refresh")
+    
+    async def _process_fill(self, order_id: str, order_info: Dict, fill_status: Dict):
+        """Process a filled order and update profit tracking"""
+        try:
+            fill_price = fill_status.get('fill_price', order_info['price'])
+            fill_size = fill_status.get('filled_size', order_info['size'])
+            fee = fill_status.get('fee', 0.0)
+            side = order_info['side']
+            
+            # Update position and PnL atomically
+            async with self.trading_lock:
+                # Update total fees
+                self.total_fees_paid += fee
+            
+                # Update position tracking with volume-weighted average entry price
+                if side == 'buy':
+                    # Buying - update average entry price
+                    if self.current_position >= 0:  # Adding to long or starting long
+                        old_value = self.current_position * self.avg_entry_price
+                        new_value = fill_size * fill_price
+                        total_position = self.current_position + fill_size
+                        self.avg_entry_price = (old_value + new_value) / total_position if total_position > 0 else 0
+                    else:  # Covering short position
+                        if abs(self.current_position) <= fill_size:  # Closing short position completely
+                            # Calculate realized PnL for the closed portion
+                            closed_size = abs(self.current_position)
+                            pnl = closed_size * (self.avg_entry_price - fill_price)  # Short PnL
+                            self.realized_pnl += pnl
+                            self.trade_count += 1
+                            
+                            # Reset for any remaining long position
+                            remaining_size = fill_size - closed_size
+                            if remaining_size > 0:
+                                self.avg_entry_price = fill_price
+                            else:
+                                self.avg_entry_price = 0
+                            
+                            logger.info(f"Closed short position: PnL {pnl:.4f}, Remaining size: {remaining_size}")
+                        else:  # Partially covering short
+                            # No PnL realization, just reduce position
+                            pass
+                else:  # sell
+                    # Selling - opposite logic
+                    if self.current_position <= 0:  # Adding to short or starting short
+                        old_value = abs(self.current_position) * self.avg_entry_price
+                        new_value = fill_size * fill_price
+                        total_position = abs(self.current_position) + fill_size
+                        self.avg_entry_price = (old_value + new_value) / total_position if total_position > 0 else 0
+                    else:  # Covering long position
+                        if self.current_position <= fill_size:  # Closing long position completely
+                            # Calculate realized PnL for the closed portion
+                            closed_size = self.current_position
+                            pnl = closed_size * (fill_price - self.avg_entry_price)  # Long PnL
+                            self.realized_pnl += pnl
+                            self.trade_count += 1
+                            
+                            # Reset for any remaining short position
+                            remaining_size = fill_size - closed_size
+                            if remaining_size > 0:
+                                self.avg_entry_price = fill_price
+                            else:
+                                self.avg_entry_price = 0
+                            
+                            logger.info(f"Closed long position: PnL {pnl:.4f}, Remaining size: {remaining_size}")
+                        else:  # Partially covering long
+                            # No PnL realization, just reduce position
+                            pass
+                
+                # Update position last (after all calculations)
+                if side == 'buy':
+                    self.current_position += fill_size
+                else:
+                    self.current_position -= fill_size
+                
+                # Log the fill
+                logger.info(f"🎯 FILL: {side.upper()} {fill_size:.4f} @ {fill_price:.2f}, "
+                           f"Fee: {fee:.4f}, Position: {self.current_position:.4f}, PnL: {self.realized_pnl:.4f}")
+                
+                # Log trade data
+                trade_data = {
+                    'timestamp': datetime.now().timestamp(),
+                    'order_id': order_id,
+                    'asset': self.coin,
+                    'side': side,
+                    'size': fill_size,
+                    'price': fill_price,
+                    'position_after': self.current_position,
+                    'pnl': self.realized_pnl,
+                    'pnl_after': self.realized_pnl - fee  # PnL after fees
+                }
+                self.trade_logger.log_trade(trade_data)
+                
+                # Set protective bracket (TP + SL) after successful fill processing
+                if self.enable_bracket_protection:
+                    await self._set_protective_bracket(fill_price, fill_size, side)
+            
+        except Exception as e:
+            logger.error(f"Error processing fill for order {order_id}: {e}")
+    
+    async def _set_protective_bracket(self, fill_price: float, fill_size: float, side: str):
+        """Set both take-profit and stop-loss bracket orders after fill"""
+        try:
+            # Calculate TP and SL prices based on configuration
+            if side == 'buy':  # Long position
+                tp_price = fill_price * (1 + self.profit_target_pct)
+                sl_price = fill_price * (1 - self.stop_loss_pct)
+                
+                # Place sell TP and SL orders to close long position
+                tp_order_id = await self.executor.place_take_profit_sell_order(
+                    self.coin, fill_size, tp_price
+                )
+                sl_order_id = await self.executor.place_stop_sell_order(
+                    self.coin, fill_size, sl_price
+                )
+                
+            else:  # Short position  
+                tp_price = fill_price * (1 - self.profit_target_pct)
+                sl_price = fill_price * (1 + self.stop_loss_pct)
+                
+                # Place buy TP and SL orders to close short position
+                tp_order_id = await self.executor.place_take_profit_buy_order(
+                    self.coin, fill_size, tp_price
+                )
+                sl_order_id = await self.executor.place_stop_buy_order(
+                    self.coin, fill_size, sl_price
+                )
+            
+            # Track bracket orders if both were placed successfully
+            async with self.trading_lock:
+                bracket_info = {
+                    'original_fill_price': fill_price,
+                    'original_fill_size': fill_size,
+                    'original_side': side,
+                    'tp_price': tp_price,
+                    'sl_price': sl_price,
+                    'timestamp': time.time()
+                }
+                
+                if tp_order_id:
+                    self.active_stop_orders[tp_order_id] = {
+                        **bracket_info,
+                        'order_type': 'take_profit',
+                        'side': 'sell' if side == 'buy' else 'buy',
+                        'size': fill_size,
+                        'stop_price': tp_price  # For consistent interface
+                    }
+                
+                if sl_order_id:
+                    self.active_stop_orders[sl_order_id] = {
+                        **bracket_info,
+                        'order_type': 'stop_loss', 
+                        'side': 'sell' if side == 'buy' else 'buy',
+                        'size': fill_size,
+                        'stop_price': sl_price
+                    }
+            
+            # Log bracket placement
+            if tp_order_id and sl_order_id:
+                logger.info(f"🎯🛡️ Set bracket: TP @ {tp_price:.2f} (+{self.profit_target_pct:.1%}) | "
+                           f"SL @ {sl_price:.2f} (-{self.stop_loss_pct:.1%}) for {side} fill @ {fill_price:.2f}")
+            elif tp_order_id:
+                logger.warning(f"🎯 Only TP placed @ {tp_price:.2f} - SL failed")
+            elif sl_order_id:
+                logger.warning(f"🛡️ Only SL placed @ {sl_price:.2f} - TP failed")
             else:
-                return True, "sell", size
-        else:
-            # If we have a position, look for exit opportunities using ML-predicted TP/SL
-            X, _ = self.data_processor.prepare_data(self.current_data[-self.data_processor.sequence_length:])
-            take_profit_spread, stop_loss_spread = self._calculate_take_profit_stop_loss(X)
-            
-            if self.current_position > 0:  # Long position
-                if (current_price > self.current_price * (1 + take_profit_spread)):
-                    logger.info(f"Exit LONG: TP hit | Entry: {self.current_price:.2f}, Current: {current_price:.2f}, TP: {take_profit_spread:.6f}")
-                    return True, "sell", abs(self.current_position)
-                elif (current_price < self.current_price * (1 - stop_loss_spread)):
-                    logger.info(f"Exit LONG: SL hit | Entry: {self.current_price:.2f}, Current: {current_price:.2f}, SL: {stop_loss_spread:.6f}")
-                    return True, "sell", abs(self.current_position)
-            else:  # Short position
-                if (current_price < self.current_price * (1 - take_profit_spread)):
-                    logger.info(f"Exit SHORT: TP hit | Entry: {self.current_price:.2f}, Current: {current_price:.2f}, TP: {take_profit_spread:.6f}")
-                    return True, "buy", abs(self.current_position)
-                elif (current_price > self.current_price * (1 + stop_loss_spread)):
-                    logger.info(f"Exit SHORT: SL hit | Entry: {self.current_price:.2f}, Current: {current_price:.2f}, SL: {stop_loss_spread:.6f}")
-                    return True, "buy", abs(self.current_position)
-        return False, '', 0.0
-
-    def should_exit_position(self, current_price: float) -> Tuple[bool, str, float]:
-        """
-        Determine if we should exit an existing position.
-        Returns: (should_exit, side, size)
-        """
-        if self.current_position == 0:
-            return False, '', 0.0
-            
-        # Check for stop loss
-        if self.current_position > 0:  # Long position
-            if current_price <= self.current_price * (1 - self.stop_loss):
-                return True, 'sell', abs(self.current_position)
-        else:  # Short position
-            if current_price >= self.current_price * (1 + self.stop_loss):
-                return True, 'buy', abs(self.current_position)
-                
-        return False, '', 0.0
-
-    async def cancel_all_orders(self):
-        """Cancel all active orders"""
-        try:
-            # Get open orders using info client with account address
-            open_orders = self.info.open_orders(self.account_address)
-            if not open_orders:
-                logger.info("No open orders to cancel")
-                return
-                
-            for order in open_orders:
-                try:
-                    # Convert order ID to integer
-                    order_id = int(order['oid'])
-                    # Cancel order synchronously
-                    result = self.exchange.cancel(self.coin, order_id)
-                    logger.info(f"Canceled order {order_id}: {result}")
-                except (ValueError, KeyError) as e:
-                    logger.warning(f"Invalid order ID format: {e}")
-                except Exception as e:
-                    logger.warning(f"Error canceling order {order.get('oid')}: {e}")
+                logger.error(f"❌ Failed to place bracket orders for {side} fill @ {fill_price:.2f}")
+                           
         except Exception as e:
-            logger.error(f"Error in cancel_all_orders: {e}")
-            # Log the full error details for debugging
-            logger.error(f"Error details: {str(e)}")
-            if hasattr(e, 'response'):
-                logger.error(f"Response: {e.response.text if hasattr(e.response, 'text') else e.response}")
-
-    async def set_exit_orders(self):
-        """Set stop loss and take profit orders for current position"""
-        if self.current_position == 0:
-            return
-            
+            logger.error(f"Failed to set protective bracket: {e}")
+    
+    async def _process_bracket_fill(self, order_id: str, stop_info: Dict, fill_status: Dict):
+        """Process a filled bracket order (take-profit or stop-loss)"""
         try:
-            # Use a conservative exit percentage for both TP and SL
-            exit_percentage = self.stop_loss  # Use stop loss percentage for both TP and SL
+            fill_price = fill_status.get('fill_price', stop_info['stop_price'])
+            fill_size = fill_status.get('filled_size', stop_info['size'])
+            fee = fill_status.get('fee', 0.0)
+            side = stop_info['side']
             
-            # Calculate exit prices based on current position
-            if self.current_position > 0:  # Long position
-                stop_loss_price = self.round_price(self.current_price * (1 - exit_percentage))
-                take_profit_price = self.round_price(self.current_price * (1 + exit_percentage))  # Same percentage as SL
+            # Update position and PnL atomically
+            async with self.trading_lock:
+                # Update total fees
+                self.total_fees_paid += fee
                 
-                # Set take profit order
-                tp_order_type = {
-                    "trigger": {
-                        "triggerPx": take_profit_price,
-                        "isMarket": True,
-                        "tpsl": "tp"
-                    }
+                # Update position tracking
+                if side == 'buy':
+                    self.current_position += fill_size
+                else:
+                    self.current_position -= fill_size
+                
+                # Log the bracket execution
+                order_type = stop_info.get('order_type', 'unknown')
+                if order_type == 'take_profit':
+                    logger.info(f"🎯 TAKE-PROFIT EXECUTED: {side.upper()} {fill_size:.4f} @ {fill_price:.2f}, "
+                               f"Fee: {fee:.4f}, Position: {self.current_position:.4f}, "
+                               f"Original entry: {stop_info['original_fill_price']:.2f}")
+                elif order_type == 'stop_loss':
+                    logger.warning(f"🛡️ STOP-LOSS EXECUTED: {side.upper()} {fill_size:.4f} @ {fill_price:.2f}, "
+                                  f"Fee: {fee:.4f}, Position: {self.current_position:.4f}, "
+                                  f"Original entry: {stop_info['original_fill_price']:.2f}")
+                else:
+                    logger.info(f"📊 BRACKET ORDER EXECUTED: {side.upper()} {fill_size:.4f} @ {fill_price:.2f}, "
+                               f"Fee: {fee:.4f}, Position: {self.current_position:.4f}")
+                
+                # Calculate realized PnL from stop-loss execution
+                original_side = stop_info['original_side']
+                entry_price = stop_info['original_fill_price']
+                
+                if original_side == 'buy':  # Was long, now stopped out
+                    stop_pnl = fill_size * (fill_price - entry_price)
+                else:  # Was short, now stopped out
+                    stop_pnl = fill_size * (entry_price - fill_price)
+                
+                self.realized_pnl += stop_pnl
+                self.trade_count += 1
+                
+                # Log trade data for stop-loss
+                trade_data = {
+                    'timestamp': datetime.now().timestamp(),
+                    'order_id': order_id,
+                    'asset': self.coin,
+                    'side': side,
+                    'size': fill_size,
+                    'price': fill_price,
+                    'position_after': self.current_position,
+                    'pnl': self.realized_pnl,
+                    'pnl_after': self.realized_pnl - fee  # PnL after fees
                 }
-                tp_result = self.exchange.order(
-                    self.coin,
-                    False,  # sell for long position
-                    abs(self.current_position),
-                    take_profit_price,
-                    tp_order_type,
-                    reduce_only=True
-                )
-                logger.info(f"Set take profit order at {take_profit_price}: {tp_result}")
+                self.trade_logger.log_trade(trade_data)
                 
-                # Set stop loss order
-                sl_order_type = {
-                    "trigger": {
-                        "triggerPx": stop_loss_price,
-                        "isMarket": True,
-                        "tpsl": "sl"
-                    }
-                }
-                sl_result = self.exchange.order(
-                    self.coin,
-                    False,  # sell for long position
-                    abs(self.current_position),
-                    stop_loss_price,
-                    sl_order_type,
-                    reduce_only=True
-                )
-                logger.info(f"Set stop loss order at {stop_loss_price}: {sl_result}")
-                
-            else:  # Short position
-                stop_loss_price = self.round_price(self.current_price * (1 + exit_percentage))
-                take_profit_price = self.round_price(self.current_price * (1 - exit_percentage))  # Same percentage as SL
-                
-                # Set take profit order
-                tp_order_type = {
-                    "trigger": {
-                        "triggerPx": take_profit_price,
-                        "isMarket": True,
-                        "tpsl": "tp"
-                    }
-                }
-                tp_result = self.exchange.order(
-                    self.coin,
-                    True,  # buy for short position
-                    abs(self.current_position),
-                    take_profit_price,
-                    tp_order_type,
-                    reduce_only=True
-                )
-                logger.info(f"Set take profit order at {take_profit_price}: {tp_result}")
-                
-                # Set stop loss order
-                sl_order_type = {
-                    "trigger": {
-                        "triggerPx": stop_loss_price,
-                        "isMarket": True,
-                        "tpsl": "sl"
-                    }
-                }
-                sl_result = self.exchange.order(
-                    self.coin,
-                    True,  # buy for short position
-                    abs(self.current_position),
-                    stop_loss_price,
-                    sl_order_type,
-                    reduce_only=True
-                )
-                logger.info(f"Set stop loss order at {stop_loss_price}: {sl_result}")
+                if order_type == 'take_profit':
+                    logger.info(f"🎯 Take-profit PnL: {stop_pnl:.4f}, Total PnL: {self.realized_pnl:.4f}")
+                elif order_type == 'stop_loss':
+                    logger.info(f"🛡️ Stop-loss PnL: {stop_pnl:.4f}, Total PnL: {self.realized_pnl:.4f}")
+                else:
+                    logger.info(f"📊 Bracket PnL: {stop_pnl:.4f}, Total PnL: {self.realized_pnl:.4f}")
+            
+        except Exception as e:
+            logger.error(f"Error processing bracket fill for order {order_id}: {e}")
+
+    def calculate_simple_spread_orders(self, current_price: float) -> Tuple[float, float, float, float]:
+        """
+        Calculate simple spread orders for bracket market making
+        Returns: (bid_price, ask_price, bid_size, ask_size)
+        No position skewing - brackets handle risk management
+        """
+        base_spread = current_price * (self.spread_bps / 10000)
+        
+        # Simple spread calculation - brackets provide risk management
+        bid_price = current_price - (base_spread / 2)
+        ask_price = current_price + (base_spread / 2)
+        
+        # Fixed order sizes - brackets provide risk control
+        bid_size = self.order_size
+        ask_size = self.order_size
+        
+        return bid_price, ask_price, bid_size, ask_size
+
+    async def cancel_orders(self):
+        """Cancel existing orders using executor (with locking)"""
+        async with self.trading_lock:
+            await self._cancel_orders_unsafe()
+    
+    async def _cancel_orders_unsafe(self):
+        """Cancel existing orders without additional locking (for use within existing locks)"""
+        try:
+            if self.bid_order_id:
+                await self.executor.cancel_order(self.coin, self.bid_order_id, True)
+                if self.bid_order_id in self.active_orders:
+                    del self.active_orders[self.bid_order_id]
+                self.bid_order_id = None
+            
+            if self.ask_order_id:
+                await self.executor.cancel_order(self.coin, self.ask_order_id, False)
+                if self.ask_order_id in self.active_orders:
+                    del self.active_orders[self.ask_order_id]
+                self.ask_order_id = None
                 
         except Exception as e:
-            logger.error(f"Error setting exit orders: {e}")
-            # Log the full error details for debugging
-            logger.error(f"Error details: {str(e)}")
-            if hasattr(e, 'response'):
-                logger.error(f"Response: {e.response.text if hasattr(e.response, 'text') else e.response}")
-
-    async def run_live_trading(self, update_interval: float = 1.0):
-        """
-        Run live trading using Hyperliquid API.
-        
-        Args:
-            update_interval: Time between updates in seconds (default: 1.0s for 1-second updates)
-        """
-        data_fetcher = DataFetcher()
-        logger.info("Starting live trading...")
-        
+            logger.error(f"Error canceling orders: {e}")
+    
+    async def _cancel_stop_orders_unsafe(self):
+        """Cancel existing stop orders without additional locking (for use within existing locks)"""
         try:
-            # First, fetch initial data and train the model
-            logger.info("Fetching initial data for training...")
-            initial_data = data_fetcher.fetch_price_data()
-            if not initial_data:
-                logger.error("Failed to fetch initial data for training!")
-                return
-            
-            logger.info(f"Successfully fetched {len(initial_data)} candles for training")
-            if not self.train_model(initial_data):
-                logger.error("Failed to train model!")
-                return
-            
-            logger.info("Starting live trading loop...")
-            
-            # Initialize current_data with the last sequence_length candles
-            self.current_data = initial_data[-self.data_processor.sequence_length:]
-            logger.info(f"Initialized with {len(self.current_data)} candles for sequence")
-            self.current_price = (float(self.current_data[-1]['h']) + float(self.current_data[-1]['l'])) / 2
-            logger.info(f"Initial price set to: {self.current_price}")
-            
-            # Cancel any existing orders before starting
+            for stop_order_id, stop_info in list(self.active_stop_orders.items()):
+                is_buy = stop_info['side'] == 'buy'
+                await self.executor.cancel_order(self.coin, stop_order_id, is_buy)
+                if stop_order_id in self.active_stop_orders:
+                    del self.active_stop_orders[stop_order_id]
+                logger.debug(f"Cancelled stop order {stop_order_id}")
+                
+        except Exception as e:
+            logger.error(f"Error canceling stop orders: {e}")
+
+    async def place_position_aware_orders(self, current_position: float, current_price: float):
+        """Place orders based on current position - position-aware bracket trading"""
+        async with self.trading_lock:
             try:
-                await self.cancel_all_orders()
+                # Calculate spread orders
+                bid_price, ask_price, bid_size, ask_size = self.calculate_simple_spread_orders(current_price)
+                
+                # Position-aware order placement logic
+                if abs(current_position) < 0.01:  # Essentially flat position
+                    # Market making mode - place both bid and ask
+                    await self._place_both_orders(current_price, bid_price, ask_price, bid_size, ask_size)
+                    logger.info(f"🎯 Market making mode - Position: {current_position:.4f} (flat)")
+                    
+                elif current_position > 0.01:  # Long position
+                    # Only place sell orders to reduce exposure
+                    await self._place_sell_order_only(current_price, ask_price, ask_size)
+                    logger.info(f"📉 Long position mode - Only placing sell orders. Position: {current_position:.4f}")
+                    
+                elif current_position < -0.01:  # Short position  
+                    # Only place buy orders to reduce exposure
+                    await self._place_buy_order_only(current_price, bid_price, bid_size)
+                    logger.info(f"📈 Short position mode - Only placing buy orders. Position: {current_position:.4f}")
+                
+                self.last_order_refresh = time.time()
+                
             except Exception as e:
-                logger.warning(f"Error during initial order cancellation: {e}")
-            
-            # # Place a test market order to create an open position
-            # try:
-            #     logger.info("Placing test market order...")
-            #     test_size = 0.1  # Small test size
-            #     test_trade = await self.execute_trade("buy", test_size)  # No price parameter means market order
-            #     logger.info(f"Test market order placed: {test_trade}")
-                
-            #     # Wait a moment for the order to fill
-            #     await asyncio.sleep(2)
-                
-            #     # Check if we have an open position
-            #     if self.current_position != 0:
-            #         logger.info(f"Test order filled, current position: {self.current_position}")
-            #     else:
-            #         logger.info("Test order not filled, continuing with no position")
-            # except Exception as e:
-            #     logger.error(f"Error placing test order: {e}")
-            
-            while self.is_running:
+                logger.error(f"Error placing position-aware orders: {e}")
+    
+    async def _place_both_orders(self, current_price: float, bid_price: float, ask_price: float, bid_size: float, ask_size: float):
+        """Place both bid and ask orders (market making mode)"""
+        # Place bid order
+        if bid_price is not None and bid_size > 0:
+            self.bid_order_id = await self.executor.place_buy_order(self.coin, bid_size, bid_price)
+            if self.bid_order_id:
+                self.active_orders[self.bid_order_id] = {
+                    'side': 'buy', 'size': bid_size, 'price': bid_price, 'timestamp': time.time()
+                }
+                bid_bps_from_mid = ((current_price - bid_price) / current_price) * 10000
+                logger.info(f"📈 BUY Order: {bid_size:.4f} @ {bid_price:.2f} (-{bid_bps_from_mid:.1f} bps)")
+        
+        # Place ask order
+        if ask_price is not None and ask_size > 0:
+            self.ask_order_id = await self.executor.place_sell_order(self.coin, ask_size, ask_price)
+            if self.ask_order_id:
+                self.active_orders[self.ask_order_id] = {
+                    'side': 'sell', 'size': ask_size, 'price': ask_price, 'timestamp': time.time()
+                }
+                ask_bps_from_mid = ((ask_price - current_price) / current_price) * 10000
+                logger.info(f"📉 SELL Order: {ask_size:.4f} @ {ask_price:.2f} (+{ask_bps_from_mid:.1f} bps)")
+    
+    async def _place_buy_order_only(self, current_price: float, bid_price: float, bid_size: float):
+        """Place only buy orders (to reduce short position)"""
+        if bid_price is not None and bid_size > 0:
+            self.bid_order_id = await self.executor.place_buy_order(self.coin, bid_size, bid_price)
+            if self.bid_order_id:
+                self.active_orders[self.bid_order_id] = {
+                    'side': 'buy', 'size': bid_size, 'price': bid_price, 'timestamp': time.time()
+                }
+                bid_bps_from_mid = ((current_price - bid_price) / current_price) * 10000
+                logger.info(f"📈 BUY Order (reduce short): {bid_size:.4f} @ {bid_price:.2f} (-{bid_bps_from_mid:.1f} bps)")
+    
+    async def _place_sell_order_only(self, current_price: float, ask_price: float, ask_size: float):
+        """Place only sell orders (to reduce long position)"""
+        if ask_price is not None and ask_size > 0:
+            self.ask_order_id = await self.executor.place_sell_order(self.coin, ask_size, ask_price)
+            if self.ask_order_id:
+                self.active_orders[self.ask_order_id] = {
+                    'side': 'sell', 'size': ask_size, 'price': ask_price, 'timestamp': time.time()
+                }
+                ask_bps_from_mid = ((ask_price - current_price) / current_price) * 10000
+                logger.info(f"📉 SELL Order (reduce long): {ask_size:.4f} @ {ask_price:.2f} (+{ask_bps_from_mid:.1f} bps)")
+
+    def calculate_unrealized_pnl(self) -> float:
+        """Calculate unrealized PnL based on current position and price"""
+        if self.current_position == 0 or self.avg_entry_price == 0:
+            return 0.0
+        
+        if self.current_position > 0:  # Long position
+            return self.current_position * (self.current_price - self.avg_entry_price)
+        else:  # Short position
+            return abs(self.current_position) * (self.avg_entry_price - self.current_price)
+
+    async def trading_loop(self):
+        """Single efficient trading loop with position-aware order management"""
+        logger.info(f"Started position-aware trading loop (interval: {self.trading_interval}s)")
+        
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
+        try:
+            while self.running and not self.shutdown_requested:
                 try:
-                    # Get latest market data
-                    latest_candle = data_fetcher.fetch_latest_candle()
-                    if latest_candle:
-                        self.current_data = self.current_data[1:] + [latest_candle]
-                        self.current_price = (float(latest_candle['h']) + float(latest_candle['l'])) / 2
-                        self.current_price = self.round_price(self.current_price)
-                        
-                        # Calculate volatility
-                        volatility = self._calculate_volatility()
-                        
-                        # Check if we should enter or exit a position
-                        should_trade, side, size = self.should_enter_trade(self.current_price, volatility)
-                        
-                        if should_trade:
-                            try:
-                                # Cancel existing orders before placing new ones
-                                await self.cancel_all_orders()
-                                
-                                # Execute the trade
-                                trade = await self.execute_trade(side, size, self.current_price)
-                                logger.info(f"Executed trade: {trade}")
-                                
-                            except Exception as e:
-                                logger.error(f"Error executing trade: {e}")
+                    # 1. Check for shutdown signal
+                    if self.shutdown_requested:
+                        logger.info("🛑 Shutdown signal detected in trading loop")
+                        break
                     
-                    await asyncio.sleep(update_interval)
+                    # 2. Get current market price
+                    current_price = self.get_current_price()
+                    if current_price == 0:
+                        logger.warning("Invalid price, skipping cycle")
+                        await asyncio.sleep(self.trading_interval)
+                        continue
                     
-                except asyncio.CancelledError:
-                    logger.info("Trading loop cancelled, cleaning up...")
-                    break
+                    # 3. For paper trading, simulate fills based on market price
+                    if self.paper_trading and hasattr(self.executor, 'update_market_price'):
+                        self.executor.update_market_price(current_price)
+                    
+                    # 4. Check for fills and get updated position
+                    fills_occurred = await self.check_fills()
+                    await self.update_position()
+                    
+                    # 5. Update PnL calculations
+                    async with self.trading_lock:
+                        self.unrealized_pnl = self.calculate_unrealized_pnl()
+                        current_position = self.current_position
+                        
+                    # 6. Position-aware order placement
+                    should_refresh = (fills_occurred or 
+                                    self.needs_order_refresh or
+                                    self._should_refresh_orders())
+                    
+                    if should_refresh and not self.shutdown_requested:
+                        await self.place_position_aware_orders(current_position, current_price)
+                        self.needs_order_refresh = False
+                        
+                    # 7. Logging and status
+                    if fills_occurred:
+                        logger.info("🚀 Fills detected - orders refreshed")
+                    elif self.log_fill_checks:
+                        logger.debug(f"Trading cycle complete - Price: {current_price:.2f}, Position: {current_position:.4f}")
+                    
+                    # 8. Reset error counter and wait (with shutdown check)
+                    consecutive_errors = 0
+                    
+                    # Check for shutdown during sleep to be more responsive
+                    sleep_time = self.trading_interval
+                    sleep_increment = 0.1  # Check every 100ms
+                    slept = 0.0
+                    
+                    while slept < sleep_time and not self.shutdown_requested:
+                        await asyncio.sleep(min(sleep_increment, sleep_time - slept))
+                        slept += sleep_increment
+                    
                 except Exception as e:
-                    logger.error(f"Error in trading loop: {e}")
-                    continue
+                    consecutive_errors += 1
+                    logger.error(f"Error in trading loop iteration #{consecutive_errors}: {e}")
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.error(f"Trading loop: {consecutive_errors} consecutive errors - terminating")
+                        raise e
+                    
+                    # Cancel problematic orders before retry
+                    try:
+                        await self.cancel_orders()
+                        logger.info("Cancelled orders during error recovery")
+                    except Exception as cancel_error:
+                        logger.error(f"Failed to cancel orders during error recovery: {cancel_error}")
+                    
+                    # Exponential backoff on errors
+                    error_delay = min(self.trading_interval * (2 ** consecutive_errors), 30.0)
+                    logger.warning(f"Trading loop error recovery: waiting {error_delay:.1f}s before retry")
+                    await asyncio.sleep(error_delay)
+                
+        except Exception as e:
+            logger.error(f"Fatal error in trading loop: {e}")
+            raise
+    
+    def _should_refresh_orders(self) -> bool:
+        """Check if orders should be refreshed based on age or market conditions"""
+        current_time = time.time()
+        
+        # Refresh orders based on configurable interval
+        if current_time - self.last_order_refresh > self.order_refresh_interval:
+            return True
+            
+        # Check if orders are very old
+        trading_config = self.config['trading']
+        max_order_age = trading_config.get('max_order_age', 150)
+        
+        if ((self.bid_order_id and self.bid_order_id in self.active_orders and
+             current_time - self.active_orders[self.bid_order_id]['timestamp'] > max_order_age) or
+            (self.ask_order_id and self.ask_order_id in self.active_orders and
+             current_time - self.active_orders[self.ask_order_id]['timestamp'] > max_order_age)):
+            return True
+            
+        return False
+
+
+    async def run(self):
+        """Run the bracket market maker with single position-aware trading loop"""
+        logger.info("🚀 Starting bracket market maker with position-aware architecture...")
+        logger.info(f"Trading interval: {self.trading_interval}s")
+        logger.info("Position-aware order management: Only place orders that reduce risk")
+        
+        if not self.paper_trading and not self.executor:
+            logger.error("No valid executor configured")
+            return
+        
+        try:
+            # Start single efficient trading loop
+            await self.trading_loop()
                 
         except KeyboardInterrupt:
-            logger.info("Trading stopped by user.")
+            # This should rarely happen now due to signal handling
+            logger.info("KeyboardInterrupt caught - initiating intelligent shutdown")
+            self.shutdown_requested = True
+            self.shutdown_reason = "KeyboardInterrupt exception"
         except Exception as e:
             logger.error(f"Error in trading loop: {e}")
+            self.shutdown_requested = True
+            self.shutdown_reason = f"Trading loop exception: {e}"
         finally:
-            self.is_running = False
-            try:
-                # Cancel any existing orders
-                await self.cancel_all_orders()
-                
-                # Set stop loss and take profit orders for any open position
-                if self.current_position != 0:
-                    logger.info(f"Setting exit orders for open position of {self.current_position}")
-                    await self.set_exit_orders()
-                
-            except Exception as e:
-                logger.warning(f"Error during cleanup: {e}")
-            logger.info(f"Final PnL: {self.current_pnl:.2f}")
-            if hasattr(self, 'analytics'):
-                logger.info(self.analytics.generate_report())
-            logger.info("Trading session ended.")
-
-    def _calculate_volatility(self) -> float:
-        """Calculate current price volatility"""
-        recent_candles = self.current_data[-self.volatility_window:]
-        if len(recent_candles) < 2:
-            return 0.0
+            if self.shutdown_requested:
+                logger.info(f"🛱 Initiating intelligent shutdown - Reason: {self.shutdown_reason}")
+            else:
+                logger.info("🛱 Initiating intelligent shutdown - Normal termination")
             
-        # Calculate mid prices
-        mid_prices = [(float(candle['h']) + float(candle['l'])) / 2 for candle in recent_candles]
-        
-        # Calculate price changes
-        price_changes = []
-        for i in range(1, len(mid_prices)):
-            change = (mid_prices[i] - mid_prices[i-1]) / mid_prices[i-1]
-            price_changes.append(change)
-        
-        # Calculate volatility as standard deviation of price changes
-        if len(price_changes) < 2:
-            return 0.0
+            self.running = False
             
-        mean = sum(price_changes) / len(price_changes)
-        variance = sum((x - mean) ** 2 for x in price_changes) / len(price_changes)
-        volatility = (variance ** 0.5) * 100  # Convert to percentage
-        
-        # Log detailed volatility information
-        logger.info(
-            f"Volatility Analysis - "
-            f"Window: {self.volatility_window} candles, "
-            f"Raw Volatility: {volatility:.6f}, "
-            f"Price Changes: {[f'{x:.4f}' for x in price_changes]}, "
-            f"Current Price: {mid_prices[-1]:.2f}"
-        )
-        
-        return volatility
-
-    def _log_market_state(self, price: float, volatility: float):
-        """Log current market state"""
-        logger.info(
-            f"Market State - "
-            f"Price: {price:.2f}, "
-            f"Volatility: {volatility:.4f}, "
-            f"Position: {self.current_position:.4f}, "
-            f"PnL: {self.current_pnl:.2f}"
-        )
-
-    def _log_no_trade_reason(self, volatility: float):
-        """Log why we're not trading"""
-        reasons = []
-        
-        if volatility < self.min_volatility_threshold:
-            reasons.append(f"Low volatility ({volatility:.4f} < {self.min_volatility_threshold:.4f})")
-        
-        if volatility > self.max_volatility_threshold:
-            reasons.append(f"High volatility ({volatility:.4f} > {self.max_volatility_threshold:.4f})")
-        
-        if reasons:
-            logger.info(f"No trade: {' and '.join(reasons)}")
-
-    def _calculate_position_size(self):
-        """Calculate position size based on volatility and current position"""
-        # Base size on current position and max position (adjusted for leverage)
-        leveraged_max_size = self.max_position_size * self.leverage
-        remaining_capacity = leveraged_max_size - abs(self.current_position)
-        
-        # Calculate volatility from recent candles
-        volatility = self._calculate_volatility()
-        
-        # Scale position size based on volatility
-        if volatility > self.volatility_scaling_threshold:
-            # Reduce position size as volatility increases
-            scale_factor = self.min_volatility_factor
-        else:
-            # Increase position size as volatility decreases
-            scale_factor = self.max_volatility_factor
+            # Intelligent shutdown with position management
+            await self._intelligent_shutdown()
             
-        position_size = self.max_position_size * scale_factor
-        
-        # Log position sizing decision
-        logger.info(
-            f"Position Sizing - "
-            f"Volatility: {volatility:.4f}, "
-            f"Scale Factor: {scale_factor:.2f}, "
-            f"Position Size: {position_size:.4f}"
-        )
-        
-        return min(position_size, remaining_capacity)
+            logger.info("📊 Bracket market maker stopped")
 
-    def _calculate_take_profit_stop_loss(self, X):
-        """
-        Use ML model to predict optimal take-profit and stop-loss spreads
-        Returns: (take_profit_spread, stop_loss_spread)
-        """
-        if len(X) > 0:
-            current_sequence = X[-1:]
-            with torch.no_grad():
-                model_outputs = self.model(torch.FloatTensor(current_sequence))
-                take_profit_spread = model_outputs[0][0].item()
-                stop_loss_spread = model_outputs[0][2].item()
-                
-                # Log ML predictions
-                logger.info(
-                    f"ML Risk Management - "
-                    f"TP Spread: {take_profit_spread:.6f}, "
-                    f"SL Spread: {stop_loss_spread:.6f}"
-                )
-        else:
-            # Fallback to static config values if not enough data
-            take_profit_spread = self.profit_target
-            stop_loss_spread = self.stop_loss
-            logger.info(
-                f"Using Static Risk Management - "
-                f"TP: {take_profit_spread:.6f}, "
-                f"SL: {stop_loss_spread:.6f}"
-            )
-        return take_profit_spread, stop_loss_spread
-
-    async def cleanup(self):
-        """Clean up resources before exiting"""
-        logger.info("Cleaning up before exiting...")
+    async def _intelligent_shutdown(self):
+        """Intelligent shutdown with position closure and comprehensive risk analysis"""
         try:
-            # Cancel all orders
-            await self.cancel_all_orders()
+            # 1. Get current market price for calculations
+            current_price = self.get_current_price()
             
-            # Set exit orders for any open position
-            if self.current_position != 0:
-                logger.info(f"Setting exit orders for open position of {self.current_position}")
-                await self.set_exit_orders()
+            # 2. Update final position and calculate PnL
+            await self.update_position()
             
+            async with self.trading_lock:
+                final_position = self.current_position
+                self.unrealized_pnl = self.calculate_unrealized_pnl()
+                total_pnl = self.realized_pnl + self.unrealized_pnl
+                
+                logger.info("=" * 60)
+                logger.info("🔍 INTELLIGENT SHUTDOWN ANALYSIS")
+                logger.info("=" * 60)
+                
+                # 3. Current Status Report
+                logger.info(f"📊 Current Status:")
+                logger.info(f"   Price: {current_price:.4f}")
+                logger.info(f"   Position: {final_position:.4f}")
+                logger.info(f"   Realized PnL: {self.realized_pnl:.4f}")
+                logger.info(f"   Unrealized PnL: {self.unrealized_pnl:.4f}")
+                logger.info(f"   Total PnL: {total_pnl:.4f}")
+                logger.info(f"   Trades: {self.trade_count}")
+                logger.info(f"   Fees Paid: {self.total_fees_paid:.4f}")
+                
+                # 4. Risk Analysis if position is open
+                if abs(final_position) > 0.01:
+                    await self._analyze_position_risk(final_position, current_price)
+                    
+                    # 5. Attempt to close position intelligently
+                    closure_success = await self._attempt_position_closure(final_position, current_price)
+                    
+                    if closure_success:
+                        logger.info("✅ Position successfully closed")
+                    else:
+                        logger.warning("⚠️ Position remains open - monitor manually!")
+                        await self._log_manual_closure_instructions(final_position, current_price)
+                else:
+                    logger.info("✅ No open position - clean shutdown")
+                
+                # 6. Cancel all remaining orders
+                await self.cancel_orders()
+                await self._cancel_stop_orders_unsafe()
+                
+                # 7. Final session summary
+                await self._log_final_session_summary(total_pnl)
+                
         except Exception as e:
-            logger.warning(f"Error during cleanup: {e}")
-        logger.info(f"Final PnL: {self.current_pnl:.2f}")
-        if hasattr(self, 'analytics'):
-            logger.info(self.analytics.generate_report())
-        logger.info("Trading session ended.")
+            logger.error(f"Error during intelligent shutdown: {e}")
+            # Fallback to basic shutdown
+            await self.cancel_orders()
+            async with self.trading_lock:
+                await self._cancel_stop_orders_unsafe()
+    
+    async def _analyze_position_risk(self, position: float, current_price: float):
+        """Analyze maximum risk and potential outcomes for open position"""
+        logger.info("🎯 POSITION RISK ANALYSIS:")
+        
+        if position > 0:  # Long position
+            # Calculate distances to TP and SL based on average entry price
+            if self.avg_entry_price > 0:
+                entry_price = self.avg_entry_price
+                tp_price = entry_price * (1 + self.profit_target_pct)
+                sl_price = entry_price * (1 - self.stop_loss_pct)
+                
+                max_gain = position * (tp_price - entry_price)
+                max_loss = position * (entry_price - sl_price)
+                current_unrealized = position * (current_price - entry_price)
+                
+                logger.info(f"   📈 Long Position Analysis:")
+                logger.info(f"   Entry Price: {entry_price:.4f}")
+                logger.info(f"   Take Profit: {tp_price:.4f} (max gain: +{max_gain:.4f})")
+                logger.info(f"   Stop Loss: {sl_price:.4f} (max loss: -{max_loss:.4f})")
+                logger.info(f"   Current P&L: {current_unrealized:.4f}")
+                
+                # Distance analysis
+                tp_distance = abs(current_price - tp_price) / current_price * 10000
+                sl_distance = abs(current_price - sl_price) / current_price * 10000
+                logger.info(f"   Distance to TP: {tp_distance:.1f} bps")
+                logger.info(f"   Distance to SL: {sl_distance:.1f} bps")
+                
+        else:  # Short position
+            if self.avg_entry_price > 0:
+                entry_price = self.avg_entry_price
+                tp_price = entry_price * (1 - self.profit_target_pct)
+                sl_price = entry_price * (1 + self.stop_loss_pct)
+                
+                max_gain = abs(position) * (entry_price - tp_price)
+                max_loss = abs(position) * (sl_price - entry_price)
+                current_unrealized = abs(position) * (entry_price - current_price)
+                
+                logger.info(f"   📉 Short Position Analysis:")
+                logger.info(f"   Entry Price: {entry_price:.4f}")
+                logger.info(f"   Take Profit: {tp_price:.4f} (max gain: +{max_gain:.4f})")
+                logger.info(f"   Stop Loss: {sl_price:.4f} (max loss: -{max_loss:.4f})")
+                logger.info(f"   Current P&L: {current_unrealized:.4f}")
+                
+                # Distance analysis
+                tp_distance = abs(current_price - tp_price) / current_price * 10000
+                sl_distance = abs(current_price - sl_price) / current_price * 10000
+                logger.info(f"   Distance to TP: {tp_distance:.1f} bps")
+                logger.info(f"   Distance to SL: {sl_distance:.1f} bps")
+    
+    async def _attempt_position_closure(self, position: float, current_price: float) -> bool:
+        """Attempt to close position with market order"""
+        try:
+            logger.info("🎯 ATTEMPTING POSITION CLOSURE:")
+            
+            if abs(position) < 0.01:
+                return True  # Already flat
+            
+            if position > 0:  # Close long position
+                logger.info(f"   Placing market sell order for {position:.4f} to close long position")
+                
+                if self.paper_trading:
+                    # For paper trading, simulate the closure
+                    self.current_position = 0.0
+                    closure_pnl = position * (current_price - self.avg_entry_price)
+                    self.realized_pnl += closure_pnl
+                    logger.info(f"   [PAPER] Position closed at market price {current_price:.4f}")
+                    logger.info(f"   [PAPER] Closure PnL: {closure_pnl:.4f}")
+                    return True
+                else:
+                    # For live trading, place market sell order
+                    order_id = await self.executor.place_market_sell_order(self.coin, position)
+                    if order_id:
+                        logger.info(f"   Market sell order placed: {order_id}")
+                        return True
+                    else:
+                        logger.error("   Failed to place market sell order")
+                        return False
+                        
+            else:  # Close short position
+                position_size = abs(position)
+                logger.info(f"   Placing market buy order for {position_size:.4f} to close short position")
+                
+                if self.paper_trading:
+                    # For paper trading, simulate the closure
+                    self.current_position = 0.0
+                    closure_pnl = position_size * (self.avg_entry_price - current_price)
+                    self.realized_pnl += closure_pnl
+                    logger.info(f"   [PAPER] Position closed at market price {current_price:.4f}")
+                    logger.info(f"   [PAPER] Closure PnL: {closure_pnl:.4f}")
+                    return True
+                else:
+                    # For live trading, place market buy order
+                    order_id = await self.executor.place_market_buy_order(self.coin, position_size)
+                    if order_id:
+                        logger.info(f"   Market buy order placed: {order_id}")
+                        return True
+                    else:
+                        logger.error("   Failed to place market buy order")
+                        return False
+                        
+        except Exception as e:
+            logger.error(f"Error attempting position closure: {e}")
+            return False
+    
+    async def _log_manual_closure_instructions(self, position: float, current_price: float):
+        """Log instructions for manual position closure"""
+        logger.info("📋 MANUAL CLOSURE INSTRUCTIONS:")
+        
+        if position > 0:
+            logger.info(f"   🔴 LONG POSITION OPEN: {position:.4f}")
+            logger.info(f"   📝 Manual Action: SELL {position:.4f} {self.coin} at market")
+            logger.info(f"   💰 Current Value: {position * current_price:.4f}")
+        else:
+            position_size = abs(position)
+            logger.info(f"   🔴 SHORT POSITION OPEN: {position_size:.4f}")
+            logger.info(f"   📝 Manual Action: BUY {position_size:.4f} {self.coin} at market")
+            logger.info(f"   💰 Current Cost: {position_size * current_price:.4f}")
+        
+        logger.info(f"   ⚠️ MONITOR: Stop-loss and take-profit orders may still be active")
+        logger.info(f"   📊 Current Price: {current_price:.4f}")
+    
+    async def _log_final_session_summary(self, total_pnl: float):
+        """Log comprehensive final session summary"""
+        logger.info("=" * 60)
+        logger.info("📋 FINAL SESSION SUMMARY")
+        logger.info("=" * 60)
+        
+        # Performance metrics
+        win_rate = (self.trade_count - sum(1 for t in [] if t < 0)) / max(self.trade_count, 1) * 100 if self.trade_count > 0 else 0
+        avg_trade = self.realized_pnl / max(self.trade_count, 1) if self.trade_count > 0 else 0
+        
+        logger.info(f"🎯 Performance:")
+        logger.info(f"   Total PnL: {total_pnl:.4f}")
+        logger.info(f"   Realized PnL: {self.realized_pnl:.4f}")
+        logger.info(f"   Unrealized PnL: {self.unrealized_pnl:.4f}")
+        logger.info(f"   Total Trades: {self.trade_count}")
+        logger.info(f"   Average Trade: {avg_trade:.4f}")
+        logger.info(f"   Total Fees: {self.total_fees_paid:.4f}")
+        logger.info(f"   Net PnL (after fees): {total_pnl - self.total_fees_paid:.4f}")
+        
+        # Update trade logger with final session data
+        self.trade_logger.update_metadata('end_time', datetime.now().isoformat())
+        self.trade_logger.update_metadata('final_pnl', total_pnl)
+        self.trade_logger.update_metadata('final_position', self.current_position)
+        self.trade_logger.update_metadata('total_trades', self.trade_count)
+        
+        logger.info(f"💾 Session data saved to: {self.trade_logger.session_dir}")
+        logger.info("=" * 60)
+    
+    def stop(self):
+        """Stop the market maker"""
+        self.running = False
+
+
+async def main():
+    """Main entry point with comprehensive signal handling"""
+    import sys
+    
+    # Check for paper trading flag
+    paper_trading = "--paper" in sys.argv or "-p" in sys.argv
+    
+    logger.info("🚀 Starting Bracket Market Maker...")
+    logger.info("📘 Use Ctrl+C (SIGINT) or SIGTERM for controlled shutdown")
+    
+    market_maker = None
+    
+    try:
+        market_maker = BracketMarketMaker(paper_trading=paper_trading)
+        logger.info("✅ Market maker initialized successfully")
+        
+        # Run the market maker (signal handling is done in the class)
+        await market_maker.run()
+        
+    except KeyboardInterrupt:
+        # This should rarely happen due to signal handling in the class
+        logger.info("🛑 Main: KeyboardInterrupt caught")
+        if market_maker:
+            market_maker.shutdown_requested = True
+            market_maker.shutdown_reason = "Main KeyboardInterrupt"
+    except Exception as e:
+        logger.error(f"❌ Failed to run market maker: {e}")
+        import traceback
+        logger.error(f"Stack trace: {traceback.format_exc()}")
+        if market_maker:
+            market_maker.shutdown_requested = True
+            market_maker.shutdown_reason = f"Main exception: {e}"
+    finally:
+        if market_maker:
+            # Ensure the market maker is properly stopped
+            if market_maker.running or not market_maker.shutdown_requested:
+                logger.info("🔧 Ensuring proper shutdown in main cleanup")
+                market_maker.stop()
+        
+        logger.info("🏁 Main function cleanup complete")
 
 
 if __name__ == "__main__":
-    # Create and run the market maker
-    market_maker = MarketMaker()
-    
-    def handle_exit():
-        """Handle exit signals"""
-        logger.info("Received exit signal, cleaning up...")
-        market_maker.is_running = False
-    
-    # Set up signal handlers
-    signal.signal(signal.SIGINT, lambda s, f: handle_exit())
-    signal.signal(signal.SIGTSTP, lambda s, f: handle_exit())
-    
-    try:
-        asyncio.run(market_maker.run_live_trading())
-    except KeyboardInterrupt:
-        logger.info("Trading stopped by user (Ctrl+C)")
-    except Exception as e:
-        logger.error(f"Error in main execution: {e}")
-    finally:
-        # Clean up signal handlers
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        signal.signal(signal.SIGTSTP, signal.SIG_DFL) 
+    asyncio.run(main())
