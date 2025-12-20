@@ -3,6 +3,10 @@
 # Universal Parameters
 universal:
   asset: "HYPE"  # Trading pair (required)
+  network: "TEST"
+    #Only other option is PROD
+    # Fetched by importing HL constants "from hyperliquid.utils import constants" and doing contacts.TESTNET_API_URL
+    # TEST is for testnet, mainnet is PROD
 
 # Trading Parameters
 trading:

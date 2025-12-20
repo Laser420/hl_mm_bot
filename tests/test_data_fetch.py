@@ -1,4 +1,4 @@
-from utils.data_fetcher import DataFetcher
+from legacy_nonsense.data_fetcher import DataFetcher
 import time
 import sys
 

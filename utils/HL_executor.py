@@ -18,10 +18,12 @@ class Price:
 
 class HyperliquidExecutor():
     """Hyperliquid exchange implementation"""
+    def __init__(self, api_base_url):
+        self.api_base_url = api_base_url
 
-    async def _make_request(self, endpoint: str, data: Dict[str, Any] = None, signed: bool = False) -> Dict[str, Any]:
+    async def _make_request(self, endpoint: str, data: Dict[str, any] = None, signed: bool = False) -> Dict[str, any]:
         """Make HTTP request to Hyperliquid API"""
-        url = f"{self.base_url}{endpoint}"
+        url = f"{self.api_base_url}{endpoint}"
         
         headers = {
             'Content-Type': 'application/json'
@@ -38,7 +40,7 @@ class HyperliquidExecutor():
                     raise Exception(f"API request failed: {response.status} - {await response.text()}")
                 return await response.json()
     
-    async def get_current_price(self, symbol: str) -> Price:
+    async def get_current_price(self, symbol: str) -> float:
         """Get current price using the allMids endpoint"""
         try:
             data = {"type": "allMids"}
@@ -47,13 +49,13 @@ class HyperliquidExecutor():
             if symbol not in response:
                 raise Exception(f"Symbol {symbol} not found in market data")
             
-            mid_price = float(response[symbol])
+            return float(response[symbol])
             
-            return Price(
-                symbol=symbol,
-                price=mid_price,
-                timestamp=int(time.time())
-            )
+           # return Price(
+            ##    symbol=symbol,
+           #     price=mid_price,
+            #    timestamp=int(time.time())
+           # )
         except Exception as e:
             raise Exception(f"Failed to get current price for {symbol}: {e}")
     

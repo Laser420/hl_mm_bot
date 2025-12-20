@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple
 from hyperliquid.utils import constants
 from utils.utils import setup
 from utils.trade_logger import TradeLogger
-from utils.HL_executor import OrderExecutor, HyperliquidExecutor, PaperExecutor
+from utils.HL_executor import HyperliquidExecutor, Price
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,40 +26,38 @@ logger = logging.getLogger(__name__)
 
 
 class BracketMarketMaker:
-    def __init__(self, config_path: str = "config.yaml", paper_trading: bool = False):
+    def __init__(self, config_path: str = "config.yaml"):
         """Initialize the bracket market maker"""
         self.config = self._load_config(config_path)
-        self.paper_trading = paper_trading
         
         # Validate required configuration
         self._validate_config()
         
-        # Initialize appropriate executor
-        if paper_trading:
-            self.executor = PaperExecutor()
-            # Initialize info client for data only
-            from hyperliquid.info import Info
-            self.info = Info(base_url=constants.MAINNET_API_URL, skip_ws=True)
-            logger.info("Initialized in paper trading mode with live data")
-        else:
-            # Initialize HyperLiquid clients
+       
+        # Initialize HyperLiquid clients
+        self.network = self.config['universal']['network']
+
+        if(self.network == "PROD"):   
             accounts, info = setup(
                 base_url=constants.MAINNET_API_URL,
                 skip_ws=True
             )
-            
-            if not accounts['is_dual']:
-                raise ValueError("Live trading requires dual accounts. Use paper_trading=True for single account mode.")
-            
-            self.executor = HyperliquidExecutor(
-                accounts['buy']['exchange'],
-                accounts['sell']['exchange'], 
-                accounts['buy']['address'],
-                accounts['sell']['address'],
-                info
+        else:
+            accounts, info = setup(
+                base_url=constants.TESTNET_API_URL,
+                skip_ws=True
             )
-            self.info = info
-            logger.info("Initialized in live trading mode with dual accounts")
+            
+        self.executor = HyperliquidExecutor(
+            accounts['buy']['exchange'],
+            accounts['sell']['exchange'], 
+            accounts['buy']['address'],
+            accounts['sell']['address'],
+            info
+        )
+
+        self.info = info
+        logger.info("Initialized in live trading mode with dual accounts")
         
         # Trading parameters from config
         self.coin = self.config['universal']['asset']
@@ -112,26 +110,20 @@ class BracketMarketMaker:
         
         # Generate session ID
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if paper_trading:
-            session_id = f"paper_{session_id}"
+        if self.network == "TEST":
+            session_id = f"testnet_{session_id}"
         
         # Initialize trade logger
         self.trade_logger = TradeLogger(session_id=session_id, config=self.config)
         
-        # Signal handling for controlled shutdown
-        self.shutdown_requested = False
-        self.shutdown_reason = ""
-        self._setup_signal_handlers()
-        
         logger.info(f"Bracket Market Maker initialized - Asset: {self.coin}")
         logger.info(f"Spread: {self.spread_bps} bps, Order size: {self.order_size}")
         logger.info(f"Trading interval: {self.trading_interval}s, Order refresh: {self.order_refresh_interval}s")
-        logger.info("Signal handlers installed - Use Ctrl+C or SIGTERM for controlled shutdown")
 
     def _validate_config(self):
         """Validate required configuration parameters"""
         required_keys = {
-            'universal': ['asset'],
+            'universal': ['asset', 'network'],
             'trading': ['order_size', 'base_spread_bps']
         }
         
@@ -173,108 +165,6 @@ class BracketMarketMaker:
         except yaml.YAMLError as e:
             logger.error(f"Error parsing config file {config_path}: {e}")
             return {}
-    
-    def _setup_signal_handlers(self):
-        """Setup signal handlers for controlled shutdown"""
-        try:
-            # Handle SIGINT (Ctrl+C)
-            signal.signal(signal.SIGINT, self._signal_handler)
-            
-            # Handle SIGTERM (system termination)
-            signal.signal(signal.SIGTERM, self._signal_handler)
-            
-            # On Windows, also handle SIGBREAK (Ctrl+Break)
-            if hasattr(signal, 'SIGBREAK'):
-                signal.signal(signal.SIGBREAK, self._signal_handler)
-                
-            logger.debug("Signal handlers installed successfully")
-            
-        except Exception as e:
-            logger.warning(f"Failed to install signal handlers: {e}")
-    
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals with proper cleanup"""
-        signal_names = {
-            signal.SIGINT: "SIGINT (Ctrl+C)",
-            signal.SIGTERM: "SIGTERM (System Termination)",
-        }
-        
-        # Add Windows-specific signal if available
-        if hasattr(signal, 'SIGBREAK'):
-            signal_names[signal.SIGBREAK] = "SIGBREAK (Ctrl+Break)"
-        
-        signal_name = signal_names.get(signum, f"Signal {signum}")
-        
-        if not self.shutdown_requested:
-            self.shutdown_requested = True
-            self.shutdown_reason = f"Received {signal_name}"
-            logger.info(f"🛑 {signal_name} received - initiating controlled shutdown...")
-            logger.info("⏳ Please wait for intelligent shutdown process to complete...")
-            
-            # Stop the trading loop gracefully
-            self.running = False
-        else:
-            logger.warning(f"🚨 Multiple shutdown signals received! First: {self.shutdown_reason}, Now: {signal_name}")
-            logger.warning("⚠️ Allowing current shutdown process to complete...")
-
-    def get_current_price(self) -> float:
-        """Get current live midpoint price using allmids endpoint"""
-        try:
-            all_mids = self.info.all_mids()
-            
-            # Debug: Check the type and content of the response
-            logger.debug(f"all_mids response type: {type(all_mids)}")
-            logger.debug(f"all_mids response: {all_mids}")
-            
-            # Handle different response formats
-            if isinstance(all_mids, str):
-                logger.error(f"all_mids returned string instead of dict/list: {all_mids}")
-                return 0.0
-            
-            # Handle dictionary response (most likely format)
-            if isinstance(all_mids, dict):
-                # Check if our coin is directly in the dict
-                if self.coin in all_mids:
-                    price = float(all_mids[self.coin])
-                    self.current_price = price
-                    if self.enable_debug_logging:
-                        logger.debug(f"Current price for {self.coin}: {price:.2f}")
-                    return price
-                
-                # Maybe it's a nested structure - check keys
-                logger.debug(f"Available coins in response: {list(all_mids.keys())}")
-                
-                # Try to find nested structure
-                for key, value in all_mids.items():
-                    if isinstance(value, dict) and 'coin' in value and value['coin'] == self.coin:
-                        price = float(value['mid'])
-                        self.current_price = price
-                        logger.debug(f"Current price for {self.coin}: {price:.2f}")
-                        return price
-                
-                logger.warning(f"Price not found for {self.coin} in available coins: {list(all_mids.keys())}")
-                return 0.0
-            
-            # Handle list response (original expected format)
-            if isinstance(all_mids, list):
-                for mid_data in all_mids:
-                    if isinstance(mid_data, dict) and mid_data.get('coin') == self.coin:
-                        price = float(mid_data['mid'])
-                        self.current_price = price
-                        logger.debug(f"Current price for {self.coin}: {price:.2f}")
-                        return price
-                
-                logger.warning(f"Price not found for {self.coin} in {len(all_mids)} available coins")
-                return 0.0
-            
-            logger.error(f"all_mids returned unexpected type: {type(all_mids)}")
-            return 0.0
-            
-        except Exception as e:
-            logger.error(f"Error getting current price: {e}")
-            return 0.0
-
-    # Note: get_candle_data moved to legacy_utils.py - not needed for bracket trading
 
     async def update_position(self):
         """Update current position from exchange"""
@@ -629,6 +519,12 @@ class BracketMarketMaker:
         """Cancel existing orders using executor (with locking)"""
         async with self.trading_lock:
             await self._cancel_orders_unsafe()
+
+    async def get_current_price(self) -> float: 
+        try:
+            return await self.executor.get_current_price(self.coin)
+        except Exception as e:
+            logger.error(f"Error fetching price: {e}")
     
     async def _cancel_orders_unsafe(self):
         """Cancel existing orders without additional locking (for use within existing locks)"""
@@ -759,15 +655,11 @@ class BracketMarketMaker:
                         break
                     
                     # 2. Get current market price
-                    current_price = self.get_current_price()
+                    current_price = await self.get_current_price()
                     if current_price == 0:
                         logger.warning("Invalid price, skipping cycle")
                         await asyncio.sleep(self.trading_interval)
                         continue
-                    
-                    # 3. For paper trading, simulate fills based on market price
-                    if self.paper_trading and hasattr(self.executor, 'update_market_price'):
-                        self.executor.update_market_price(current_price)
                     
                     # 4. Check for fills and get updated position
                     fills_occurred = await self.check_fills()
@@ -855,10 +747,8 @@ class BracketMarketMaker:
         logger.info("🚀 Starting bracket market maker with position-aware architecture...")
         logger.info(f"Trading interval: {self.trading_interval}s")
         logger.info("Position-aware order management: Only place orders that reduce risk")
-        
-        if not self.paper_trading and not self.executor:
-            logger.error("No valid executor configured")
-            return
+
+        self.shutdown_requested = False
         
         try:
             # Start single efficient trading loop
@@ -890,7 +780,7 @@ class BracketMarketMaker:
         """Intelligent shutdown with position closure and comprehensive risk analysis"""
         try:
             # 1. Get current market price for calculations
-            current_price = self.get_current_price()
+            current_price = await self.get_current_price()
             
             # 2. Update final position and calculate PnL
             await self.update_position()
@@ -1003,45 +893,27 @@ class BracketMarketMaker:
             if position > 0:  # Close long position
                 logger.info(f"   Placing market sell order for {position:.4f} to close long position")
                 
-                if self.paper_trading:
-                    # For paper trading, simulate the closure
-                    self.current_position = 0.0
-                    closure_pnl = position * (current_price - self.avg_entry_price)
-                    self.realized_pnl += closure_pnl
-                    logger.info(f"   [PAPER] Position closed at market price {current_price:.4f}")
-                    logger.info(f"   [PAPER] Closure PnL: {closure_pnl:.4f}")
+                # For live trading, place market sell order
+                order_id = await self.executor.place_market_sell_order(self.coin, position)
+                if order_id:
+                    logger.info(f"   Market sell order placed: {order_id}")
                     return True
                 else:
-                    # For live trading, place market sell order
-                    order_id = await self.executor.place_market_sell_order(self.coin, position)
-                    if order_id:
-                        logger.info(f"   Market sell order placed: {order_id}")
-                        return True
-                    else:
-                        logger.error("   Failed to place market sell order")
-                        return False
+                    logger.error("   Failed to place market sell order")
+                    return False
                         
             else:  # Close short position
                 position_size = abs(position)
                 logger.info(f"   Placing market buy order for {position_size:.4f} to close short position")
                 
-                if self.paper_trading:
-                    # For paper trading, simulate the closure
-                    self.current_position = 0.0
-                    closure_pnl = position_size * (self.avg_entry_price - current_price)
-                    self.realized_pnl += closure_pnl
-                    logger.info(f"   [PAPER] Position closed at market price {current_price:.4f}")
-                    logger.info(f"   [PAPER] Closure PnL: {closure_pnl:.4f}")
+                # For live trading, place market buy order
+                order_id = await self.executor.place_market_buy_order(self.coin, position_size)
+                if order_id:
+                    logger.info(f"   Market buy order placed: {order_id}")
                     return True
                 else:
-                    # For live trading, place market buy order
-                    order_id = await self.executor.place_market_buy_order(self.coin, position_size)
-                    if order_id:
-                        logger.info(f"   Market buy order placed: {order_id}")
-                        return True
-                    else:
-                        logger.error("   Failed to place market buy order")
-                        return False
+                    logger.error("   Failed to place market buy order")
+                    return False
                         
         except Exception as e:
             logger.error(f"Error attempting position closure: {e}")
@@ -1099,20 +971,14 @@ class BracketMarketMaker:
 
 async def main():
     """Main entry point with comprehensive signal handling"""
-    import sys
-    
-    # Check for paper trading flag
-    paper_trading = "--paper" in sys.argv or "-p" in sys.argv
     
     logger.info("🚀 Starting Bracket Market Maker...")
-    logger.info("📘 Use Ctrl+C (SIGINT) or SIGTERM for controlled shutdown")
     
-    market_maker = None
+    market_maker = BracketMarketMaker()
+    #await market_maker.run()
     
     try:
-        market_maker = BracketMarketMaker(paper_trading=paper_trading)
-        logger.info("✅ Market maker initialized successfully")
-        
+        market_maker = BracketMarketMaker()
         # Run the market maker (signal handling is done in the class)
         await market_maker.run()
         
