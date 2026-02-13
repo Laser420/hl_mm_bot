@@ -1,4 +1,4 @@
-# Geoff 2.0 - A Hyperliquid Market Making Bot
+# [Broken] Geoff 2.0 - A Hyperliquid Market Making Bot
 
 Geoff 1.0 was a Feed-Forward neural network made in my connectionist computing class in university named after Old Top Gear's infamous homemade EV. Geoff is the name for things which are ambitious but rubbish.
 
